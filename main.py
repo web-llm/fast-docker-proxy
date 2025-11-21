@@ -1,14 +1,14 @@
+import os
+
+import dotenv
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from urllib.parse import urljoin, urlencode
-import os
+from contextlib import asynccontextmanager
 import uvicorn
-import dotenv
 
 dotenv.load_dotenv()
-
-app = FastAPI()
 
 CUSTOM_DOMAIN = os.getenv("CUSTOM_DOMAIN", "example.com")
 MODE = os.getenv("MODE", "prod")
@@ -30,6 +30,7 @@ routes = {
 
 
 def route_by_host(host: str) -> str:
+    """Return the upstream registry for a given hostname."""
     if host in routes:
         return routes[host]
     if MODE == "debug":
@@ -38,19 +39,50 @@ def route_by_host(host: str) -> str:
 
 
 # -----------------------------
-# Helpers
+# Global HTTP client & lifespan
 # -----------------------------
 
+client: httpx.AsyncClient | None = None
 
-async def fetch_with_client(url, method="GET", headers=None, follow_redirects=True):
-    async with httpx.AsyncClient(
-        follow_redirects=follow_redirects, timeout=30
-    ) as client:
-        return await client.request(method, url, headers=headers)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for FastAPI.
+    Initializes a global reusable HTTP client and closes it on shutdown.
+    """
+    global client
+    client = httpx.AsyncClient(timeout=30.0)
+    try:
+        yield
+    finally:
+        await client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+async def fetch_with_client(
+    url: str,
+    method: str = "GET",
+    headers: dict | None = None,
+    follow_redirects: bool = True,
+) -> httpx.Response:
+    """Wrapper around the global HTTP client."""
+    assert client is not None, "HTTP client not initialized"
+    return await client.request(
+        method,
+        url,
+        headers=headers,
+        follow_redirects=follow_redirects,
+    )
 
 
 def parse_www_authenticate(auth_header: str):
-    # example: Bearer realm="https://auth.docker.com/token",service="registry.docker.io"
+    """
+    Parse the WWW-Authenticate header for Bearer auth.
+    Example: Bearer realm="https://auth.docker.com/token",service="registry.docker.io"
+    """
     parts = auth_header.split('"')
     realm = parts[1]
     service = parts[3]
@@ -58,6 +90,7 @@ def parse_www_authenticate(auth_header: str):
 
 
 async def fetch_token(realm, service, scope, authorization):
+    """Request a token from the registry authentication server."""
     params = {}
     if service:
         params["service"] = service
@@ -72,10 +105,11 @@ async def fetch_token(realm, service, scope, authorization):
     return await fetch_with_client(url, headers=headers)
 
 
-def response_unauthorized(url: str):
+def response_unauthorized(host: str):
+    """Return a 401 response with a proper WWW-Authenticate header."""
     scheme = "http" if MODE == "debug" else "https"
     www_auth = (
-        f'Bearer realm="{scheme}://{url}/v2/auth",service="cloudflare-docker-proxy"'
+        f'Bearer realm="{scheme}://{host}/v2/auth",service="cloudflare-docker-proxy"'
     )
 
     return JSONResponse(
@@ -86,14 +120,19 @@ def response_unauthorized(url: str):
 
 
 # -----------------------------
-# Main Proxy Logic
+# Main Proxy Logic (streaming)
 # -----------------------------
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy(full_path: str, request: Request):
+    """
+    Main reverse-proxy entrypoint.
+    Routes registry API requests to the configured upstream registry,
+    with correct authentication handling and streaming of large blobs.
+    """
 
-    # 1. Determine upstream
+    # 1. Determine upstream registry
     host = request.headers.get("host")
     upstream = route_by_host(host)
 
@@ -102,7 +141,7 @@ async def proxy(full_path: str, request: Request):
 
     is_dockerhub = upstream == dockerHub
 
-    # reconstruct URL
+    # Reconstruct full URL path
     original_url = request.url
     path = "/" + full_path
 
@@ -112,7 +151,7 @@ async def proxy(full_path: str, request: Request):
             url=f"{original_url.scheme}://{host}/v2/", status_code=301
         )
 
-    # 3. === /v2/ request ===
+    # 3. Handle /v2/ (small response, no streaming needed)
     if path == "/v2/":
         upstream_url = urljoin(upstream, "/v2/")
         headers = {}
@@ -129,7 +168,7 @@ async def proxy(full_path: str, request: Request):
             content=resp.content, status_code=resp.status_code, headers=resp.headers
         )
 
-    # 4. === /v2/auth ===
+    # 4. Handle /v2/auth (token responses are small)
     if path == "/v2/auth":
         probe_url = urljoin(upstream, "/v2/")
         probe_resp = await fetch_with_client(probe_url)
@@ -143,7 +182,7 @@ async def proxy(full_path: str, request: Request):
 
         realm, service = parse_www_authenticate(auth_header)
 
-        # autocomplete DockerHub scope
+        # Autocomplete repository scope for DockerHub library images
         scope = dict(request.query_params).get("scope")
         if scope and is_dockerhub:
             parts = scope.split(":")
@@ -163,16 +202,17 @@ async def proxy(full_path: str, request: Request):
     # 5. DockerHub library auto-prefix
     if is_dockerhub:
         parts = path.split("/")
-        # path example: /v2/busybox/manifests/latest → 5 segments
+        # Example: /v2/busybox/manifests/latest → /v2/library/busybox/manifests/latest
         if len(parts) == 5:
             parts.insert(2, "library")
             new_path = "/".join(parts)
             new_url = f"{original_url.scheme}://{host}{new_path}"
             return RedirectResponse(url=new_url, status_code=301)
 
-    # 6. Proxy other requests
+    # 6. Proxy all other requests (streaming mode to reduce memory usage)
     upstream_url = upstream + path
 
+    # Hop-by-hop headers must not be forwarded
     hop_by_hop = {
         "connection",
         "keep-alive",
@@ -185,41 +225,75 @@ async def proxy(full_path: str, request: Request):
         "host",
     }
 
-    forward_headers = {}
+    forward_headers: dict[str, str] = {}
     for k, v in request.headers.items():
-        if k.lower() in hop_by_hop:
-            continue
-        forward_headers[k] = v
+        if k.lower() not in hop_by_hop:
+            forward_headers[k] = v
 
-    # For DockerHub, blob requests return 307 and client must follow manually
+    # DockerHub blob requests return 307 and must be followed manually
     follow = False if is_dockerhub else True
 
-    resp = await fetch_with_client(
+    assert client is not None, "HTTP client not initialized"
+
+    async with client.stream(
+        request.method,
         upstream_url,
-        method=request.method,
         headers=forward_headers,
         follow_redirects=follow,
-    )
+    ) as upstream_resp:
+        status_code = upstream_resp.status_code
+        response_headers = dict(upstream_resp.headers)
 
-    print(
-        f"Proxying: {upstream_url}, headers: {forward_headers}, status: {resp.status_code}"
-    )
-
-    # 6A. Unauthorized
-    if resp.status_code == 401:
-        return response_unauthorized(host)
-
-    # 6B. DockerHub blob redirect (must manually follow)
-    if is_dockerhub and resp.status_code == 307:
-        location = resp.headers.get("Location")
-        blob_resp = await fetch_with_client(location)
-        return Response(
-            blob_resp.content,
-            status_code=blob_resp.status_code,
-            headers=blob_resp.headers,
+        print(
+            f"Proxying: {upstream_url}, headers: {forward_headers}, status: {status_code}"
         )
 
-    return Response(resp.content, status_code=resp.status_code, headers=resp.headers)
+        # 6A. Unauthorized
+        if status_code == 401:
+            return response_unauthorized(host)
+
+        # 6B. DockerHub requires manual handling of 307 blob redirects
+        if is_dockerhub and status_code == 307:
+            location = upstream_resp.headers.get("Location")
+            if not location:
+                # No Location header—return 307 as-is but with an empty body
+                async def iter_empty():
+                    if False:
+                        yield b""
+
+                return StreamingResponse(
+                    iter_empty(),
+                    status_code=status_code,
+                    headers=response_headers,
+                )
+
+            # Manually stream the redirected blob
+            async with client.stream(
+                "GET",
+                location,
+                follow_redirects=True,
+            ) as blob_resp:
+                blob_headers = dict(blob_resp.headers)
+
+                # Remove hop-by-hop headers
+                for h in hop_by_hop:
+                    blob_headers.pop(h, None)
+
+                return StreamingResponse(
+                    blob_resp.aiter_bytes(),
+                    status_code=blob_resp.status_code,
+                    headers=blob_headers,
+                )
+
+        # Regular streaming proxy response
+        for h in hop_by_hop:
+            response_headers.pop(h, None)
+
+        return StreamingResponse(
+            upstream_resp.aiter_bytes(),
+            status_code=status_code,
+            headers=response_headers,
+        )
 
 
 if __name__ == "__main__":
