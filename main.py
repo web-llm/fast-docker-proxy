@@ -4,7 +4,7 @@ import dotenv
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urlencode, urljoin
 from contextlib import asynccontextmanager
 from starlette.background import BackgroundTask
 import uvicorn
@@ -32,6 +32,7 @@ routes = {
 
 def route_by_host(host: str) -> str:
     """Return the upstream registry for a given hostname."""
+    host = host.split(":", 1)[0]
     if host in routes:
         return routes[host]
     if MODE == "debug":
@@ -66,7 +67,7 @@ app = FastAPI(lifespan=lifespan)
 async def fetch_with_client(
     url: str,
     method: str = "GET",
-    headers: dict | None = None,
+    headers: list[tuple[str, str]] | dict | None = None,
     follow_redirects: bool = True,
 ) -> httpx.Response:
     """Wrapper around the global HTTP client."""
@@ -90,6 +91,15 @@ def parse_www_authenticate(auth_header: str):
     return realm, service
 
 
+def append_query_params(url: str, params: list[tuple[str, str]]) -> str:
+    """Append query parameters while preserving any existing upstream query."""
+    if not params:
+        return url
+
+    separator = "&" if "?" in url else "?"
+    return url + separator + urlencode(params)
+
+
 async def fetch_token(realm, service, scope, authorization):
     """Request a token from the registry authentication server."""
     params = {}
@@ -98,7 +108,7 @@ async def fetch_token(realm, service, scope, authorization):
     if scope:
         params["scope"] = scope
 
-    url = realm + "?" + urlencode(params)
+    url = append_query_params(realm, list(params.items()))
     headers = {}
     if authorization:
         headers["Authorization"] = authorization
@@ -125,7 +135,10 @@ def response_unauthorized(host: str):
 # -----------------------------
 
 
-@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+@app.api_route(
+    "/{full_path:path}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+)
 async def proxy(full_path: str, request: Request):
     """
     Main reverse-proxy entrypoint.
@@ -134,7 +147,7 @@ async def proxy(full_path: str, request: Request):
     """
 
     # 1. Determine upstream registry
-    host = request.headers.get("host")
+    host = request.headers.get("host", "")
     upstream = route_by_host(host)
 
     if upstream == "":
@@ -155,10 +168,10 @@ async def proxy(full_path: str, request: Request):
     # 3. Handle /v2/ (small response, no streaming needed)
     if path == "/v2/":
         upstream_url = urljoin(upstream, "/v2/")
-        headers = {}
+        headers: list[tuple[str, str]] = []
         auth = request.headers.get("Authorization")
         if auth:
-            headers["Authorization"] = auth
+            headers.append(("Authorization", auth))
 
         resp = await fetch_with_client(upstream_url, headers=headers)
 
@@ -211,7 +224,7 @@ async def proxy(full_path: str, request: Request):
             return RedirectResponse(url=new_url, status_code=301)
 
     # 6. Proxy all other requests (streaming mode to reduce memory usage)
-    upstream_url = upstream + path
+    upstream_url = append_query_params(upstream + path, list(request.query_params.multi_items()))
 
     # Hop-by-hop headers must not be forwarded
     hop_by_hop = {
@@ -226,10 +239,12 @@ async def proxy(full_path: str, request: Request):
         "host",
     }
 
-    forward_headers: dict[str, str] = {}
-    for k, v in request.headers.items():
-        if k.lower() not in hop_by_hop:
-            forward_headers[k] = v
+    forward_headers: list[tuple[str, str]] = []
+    for raw_key, raw_value in request.headers.raw:
+        key = raw_key.decode("latin-1")
+        if key.lower() in hop_by_hop:
+            continue
+        forward_headers.append((key, raw_value.decode("latin-1")))
 
     # DockerHub blob requests return 307 and must be followed manually
     follow = False if is_dockerhub else True
@@ -238,10 +253,15 @@ async def proxy(full_path: str, request: Request):
 
     # Build and send a streaming request without using an async context manager,
     # so that we can keep the stream open until the response is fully consumed.
+    body = None
+    if request.method not in {"GET", "HEAD"}:
+        body = await request.body()
+
     req = client.build_request(
         request.method,
         upstream_url,
         headers=forward_headers,
+        content=body,
     )
     upstream_resp = await client.send(
         req,
