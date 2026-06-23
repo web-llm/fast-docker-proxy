@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import dotenv
@@ -6,7 +7,6 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from urllib.parse import urlencode, urljoin
 from contextlib import asynccontextmanager
-from starlette.background import BackgroundTask
 import uvicorn
 
 dotenv.load_dotenv()
@@ -45,6 +45,8 @@ def route_by_host(host: str) -> str:
 # -----------------------------
 
 client: httpx.AsyncClient | None = None
+STREAM_CHUNK_SIZE = 1024 * 1024
+MAX_RESUME_ATTEMPTS = 32
 
 
 @asynccontextmanager
@@ -54,7 +56,8 @@ async def lifespan(app: FastAPI):
     Initializes a global reusable HTTP client and closes it on shutdown.
     """
     global client
-    client = httpx.AsyncClient(timeout=30.0)
+    timeout = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=60.0)
+    client = httpx.AsyncClient(timeout=timeout)
     try:
         yield
     finally:
@@ -99,6 +102,109 @@ def append_query_params(url: str, params: list[tuple[str, str]]) -> str:
     separator = "&" if "?" in url else "?"
     return url + separator + urlencode(params)
 
+
+def parse_content_range_start(headers: httpx.Headers | dict) -> int:
+    content_range = headers.get("content-range")
+    if not content_range:
+        return 0
+
+    # Example: bytes 62654035-1734997199/1734997200
+    unit, _, range_part = content_range.partition(" ")
+    if unit.lower() != "bytes":
+        return 0
+    start, _, _ = range_part.partition("-")
+    try:
+        return int(start)
+    except ValueError:
+        return 0
+
+
+def set_range_header(headers: list[tuple[str, str]], start: int) -> list[tuple[str, str]]:
+    next_headers: list[tuple[str, str]] = []
+    replaced = False
+    for key, value in headers:
+        if key.lower() == "range":
+            next_headers.append((key, f"bytes={start}-"))
+            replaced = True
+        else:
+            next_headers.append((key, value))
+    if not replaced:
+        next_headers.append(("Range", f"bytes={start}-"))
+    return next_headers
+
+
+def without_authorization(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [(key, value) for key, value in headers if key.lower() != "authorization"]
+
+
+def redact_headers(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    redacted: list[tuple[str, str]] = []
+    for key, value in headers:
+        if key.lower() == "authorization":
+            redacted.append((key, "<redacted>"))
+        else:
+            redacted.append((key, value))
+    return redacted
+
+
+async def stream_with_resume(
+    response: httpx.Response,
+    url: str,
+    headers: list[tuple[str, str]],
+    follow_redirects: bool,
+):
+    assert client is not None, "HTTP client not initialized"
+
+    current = response
+    next_start = parse_content_range_start(current.headers)
+    attempts = 0
+
+    while True:
+        try:
+            async for chunk in current.aiter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+                if not chunk:
+                    continue
+                next_start += len(chunk)
+                yield chunk
+            await current.aclose()
+            return
+        except asyncio.CancelledError:
+            await current.aclose()
+            raise
+        except (
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.ConnectError,
+        ) as exc:
+            await current.aclose()
+            attempts += 1
+            if attempts > MAX_RESUME_ATTEMPTS:
+                print(
+                    f"Giving up streaming {url} after {attempts} resume attempts at byte {next_start}: {exc!r}"
+                )
+                raise
+
+            retry_headers = set_range_header(headers, next_start)
+            delay = min(2 ** (attempts - 1), 10)
+            print(
+                f"Resuming {url} from byte {next_start} after upstream stream error "
+                f"(attempt {attempts}/{MAX_RESUME_ATTEMPTS}): {exc!r}"
+            )
+            await asyncio.sleep(delay)
+
+            req = client.build_request("GET", url, headers=retry_headers)
+            current = await client.send(
+                req,
+                stream=True,
+                follow_redirects=follow_redirects,
+            )
+
+            if current.status_code != 206:
+                await current.aclose()
+                raise httpx.RemoteProtocolError(
+                    f"resume request for {url} returned {current.status_code}, expected 206"
+                )
 
 async def fetch_token(realm, service, scope, authorization):
     """Request a token from the registry authentication server."""
@@ -273,7 +379,7 @@ async def proxy(full_path: str, request: Request):
     response_headers = dict(upstream_resp.headers)
 
     print(
-        f"Proxying: {upstream_url}, headers: {forward_headers}, status: {status_code}"
+        f"Proxying: {upstream_url}, headers: {redact_headers(forward_headers)}, status: {status_code}"
     )
 
     # 6A. Unauthorized
@@ -303,40 +409,43 @@ async def proxy(full_path: str, request: Request):
         await upstream_resp.aclose()
 
         # Manually stream the redirected blob
-        blob_req = client.build_request("GET", location)
+        blob_request_headers = without_authorization(forward_headers)
+        blob_req = client.build_request("GET", location, headers=blob_request_headers)
         blob_resp = await client.send(
             blob_req,
             stream=True,
             follow_redirects=True,
         )
-        blob_headers = dict(blob_resp.headers)
+        blob_response_headers = dict(blob_resp.headers)
 
         # Remove hop-by-hop headers
         for h in hop_by_hop:
-            blob_headers.pop(h, None)
-
-        # Use a background task to close blob_resp once streaming is done
-        background = BackgroundTask(blob_resp.aclose)
+            blob_response_headers.pop(h, None)
 
         return StreamingResponse(
-            blob_resp.aiter_bytes(),
+            stream_with_resume(
+                blob_resp,
+                location,
+                blob_request_headers,
+                follow_redirects=True,
+            ),
             status_code=blob_resp.status_code,
-            headers=blob_headers,
-            background=background,
+            headers=blob_response_headers,
         )
 
     # Regular streaming proxy response
     for h in hop_by_hop:
         response_headers.pop(h, None)
 
-    # Use a background task to close upstream_resp when done streaming
-    background = BackgroundTask(upstream_resp.aclose)
-
     return StreamingResponse(
-        upstream_resp.aiter_bytes(),
+        stream_with_resume(
+            upstream_resp,
+            upstream_url,
+            forward_headers,
+            follow_redirects=follow,
+        ),
         status_code=status_code,
         headers=response_headers,
-        background=background,
     )
 
 
